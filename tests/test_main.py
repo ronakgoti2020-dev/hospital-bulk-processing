@@ -117,6 +117,11 @@ def test_health_check(client):
 
 class TestBulkCreate:
     def test_successful_bulk_create(self, client):
+        """
+        POST returns 202 immediately with status=pending.
+        Background processing completes synchronously inside TestClient,
+        so we then poll GET to confirm the final completed state.
+        """
         csv_data = _make_csv(
             ("General Hospital", "1 Main St", "555-0001"),
             ("City Clinic", "2 Park Ave", "555-0002"),
@@ -130,17 +135,22 @@ class TestBulkCreate:
                 files={"file": ("hospitals.csv", csv_data, "text/csv")},
             )
 
-        assert resp.status_code == 200
+        assert resp.status_code == 202
         data = resp.json()
-        assert data["total_hospitals"] == 3
-        assert data["processed_hospitals"] == 3
-        assert data["failed_hospitals"] == 0
-        assert data["batch_activated"] is True
-        assert data["status"] == BatchStatus.COMPLETED
-        assert len(data["hospitals"]) == 3
-        assert data["hospitals"][0]["status"] == "created_and_activated"
         assert data["batch_id"] is not None
-        assert data["processing_time_seconds"] >= 0
+        assert data["total_hospitals"] == 3
+
+        # Poll for final result (background task runs synchronously in TestClient)
+        poll = client.get(f"/hospitals/bulk/{data['batch_id']}")
+        assert poll.status_code == 200
+        result = poll.json()
+        assert result["processed_hospitals"] == 3
+        assert result["failed_hospitals"] == 0
+        assert result["batch_activated"] is True
+        assert result["status"] == BatchStatus.COMPLETED
+        assert len(result["hospitals"]) == 3
+        assert result["hospitals"][0]["status"] == "created_and_activated"
+        assert result["processing_time_seconds"] >= 0
 
     def test_empty_file_returns_400(self, client):
         resp = client.post(
@@ -219,8 +229,11 @@ class TestBulkCreate:
                 files={"file": ("mixed.csv", csv_data, "text/csv")},
             )
 
-        assert resp.status_code == 200
-        data = resp.json()
+        assert resp.status_code == 202
+        batch_id = resp.json()["batch_id"]
+
+        poll = client.get(f"/hospitals/bulk/{batch_id}")
+        data = poll.json()
         assert data["failed_hospitals"] == 1
         assert data["processed_hospitals"] == 1
         assert data["status"] == BatchStatus.PARTIAL

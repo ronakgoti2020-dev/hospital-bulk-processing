@@ -95,7 +95,7 @@ class InternalBatchState(BaseModel):
     def processing_time_seconds(self) -> float:
         if self.started_at is None:
             return 0.0
-        end = self.completed_at or datetime.utcnow()
+        end = self.completed_at or datetime.now(timezone.utc)
         return round((end - self.started_at).total_seconds(), 3)
 
     def to_result(self) -> BatchProcessingResult:

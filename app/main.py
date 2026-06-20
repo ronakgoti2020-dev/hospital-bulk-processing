@@ -92,24 +92,30 @@ async def health_check():
 @app.post(
     "/hospitals/bulk",
     response_model=BatchProcessingResult,
-    status_code=200,
+    status_code=202,
     summary="Bulk create hospitals from a CSV file",
     tags=["bulk"],
 )
-async def bulk_create_hospitals(file: UploadFile = File(...)):
+async def bulk_create_hospitals(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+):
     """
     Upload a CSV file with columns **name**, **address**, **phone** (optional).
 
-    Processing steps:
+    Returns **202 Accepted** immediately with a `batch_id` and `status: pending`.
+    Processing runs in the background — track progress via:
+
+    - **Poll:** `GET /hospitals/bulk/{batch_id}`
+    - **Real-time:** `WS /hospitals/bulk/{batch_id}/ws`
+
+    Processing steps (background):
     1. Validate the CSV (max 20 rows, required columns present, no blank required fields).
-    2. Generate a unique batch ID.
-    3. Concurrently POST each hospital to the Hospital Directory API (up to 5 in parallel).
-    4. If all hospitals were created successfully, activate the batch.
-    5. Return comprehensive results.
+    2. Concurrently POST each hospital to the Hospital Directory API (up to 5 in parallel).
+    3. If all hospitals were created successfully, activate the batch.
     """
     # ----- content-type guard -----
     if file.content_type not in ("text/csv", "text/plain", "application/csv", "application/octet-stream"):
-        # Accept any content-type but warn; many clients send application/octet-stream
         logger.warning("Received file with content_type=%s", file.content_type)
 
     content = await file.read()
@@ -138,7 +144,7 @@ async def bulk_create_hospitals(file: UploadFile = File(...)):
             detail=f"CSV contains {len(hospitals)} rows; maximum allowed is {MAX_HOSPITALS}.",
         )
 
-    # ----- build batch state -----
+    # ----- build batch state & return immediately -----
     batch_id = str(uuid.uuid4())
     batch = InternalBatchState(
         batch_id=batch_id,
@@ -147,19 +153,27 @@ async def bulk_create_hospitals(file: UploadFile = File(...)):
         created_at=datetime.now(timezone.utc),
     )
     save_batch(batch)
-    logger.info("Batch %s created with %d hospitals.", batch_id, len(hospitals))
+    logger.info("Batch %s accepted with %d hospitals — starting background processing.", batch_id, len(hospitals))
 
-    # ----- process (awaited – synchronous from the client's perspective) -----
-    await process_batch(batch)
+    # ----- kick off processing in the background -----
+    background_tasks.add_task(_run_batch_background, batch)
 
-    logger.info(
-        "Batch %s completed: %d ok, %d failed, activated=%s.",
-        batch_id,
-        batch.processed_hospitals,
-        batch.failed_hospitals,
-        batch.batch_activated,
-    )
     return batch.to_result()
+
+
+async def _run_batch_background(batch: InternalBatchState) -> None:
+    """Background task wrapper — logs completion/failure."""
+    try:
+        await process_batch(batch)
+        logger.info(
+            "Batch %s completed: %d ok, %d failed, activated=%s.",
+            batch.batch_id,
+            batch.processed_hospitals,
+            batch.failed_hospitals,
+            batch.batch_activated,
+        )
+    except Exception as exc:
+        logger.exception("Batch %s crashed: %s", batch.batch_id, exc)
 
 
 # --------------------------------------------------------------------------- #
